@@ -152,7 +152,7 @@ python inference.py \
 ```
 
 Optional arguments:
-- `--checkpoint 0190000` — specify a checkpoint iteration (defaults to latest)
+- `--checkpoint 0180000` — specify a checkpoint iteration (defaults to latest)
 - `--shape_coef shape.npy` — FLAME shape coefficients [100,] (defaults to neutral)
 - `--style_coef style_motion.npy` — motion sequence for style reference [T, D]
 - `--cfg_scale 1.15` — classifier-free guidance scale
@@ -161,14 +161,19 @@ The output `.npy` file contains motion coefficients of shape `[n_frames, coef_di
 
 ---
 
+## Download Pretrained Model
+
+You can download the pretrained model from here:
+
+
 ## Evaluation (Benchmark)
 
-To reproduce evaluation numbers from the paper:
+To run evaluation:
 
 ```bash
 python benchmark_inference_for_eval.py \
     --model_dir experiments/dpt/<exp_name> \
-    --checkpoint 0190000 \
+    --checkpoint 0180000 \
     --dataset_type celebv-text-flmae-full \
     --data_root data/ \
     --stats_file data/coef_stats.npz \
