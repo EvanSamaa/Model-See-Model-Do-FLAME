@@ -1,80 +1,208 @@
-© [2025] Ubisoft Entertainment. All Rights Reserved
+# MSMD: Motion Style and Motion Diffusion
 
-# Model See Model Do: Speech-Driven Facial Animation with Style Control
+Official code release for the MSMD paper.
 
-# Overview:
-This repo contains supplementary code for the paper [MSMD](https://ubisoft-laforge.github.io/character/msmd/) to help with reproducibility. The code is based on the diffusion implementation from [Diffposetalk](https://github.com/DiffPoseTalk/DiffPoseTalk) and can be divided into two components:
-* **pre-processing pipeline**: a pre-processing pipeline that can be used to process an arbitrary audiovisual dataset (like [Ravdess](https://paperswithcode.com/dataset/ravdess) or [CelebV-text](https://celebv-text.github.io/)) into a latent face representation, like FLAME parameters ([link](https://flame.is.tue.mpg.de/)) or SEREP ([link](https://arxiv.org/abs/2412.14371)) latent code. 
-* **training code**: training code contains essential code like dataloader, training loop, and model architecture to aid in reproducing paper results. 
+MSMD is a speech-driven 3D facial animation system that generates stylistic, diverse FLAME motion coefficients from audio. It builds on [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk) with a static/dynamic motion decomposition and a VAE-based style encoder.
 
-# Setup:
+---
 
-- build a docker image based on the dockerfile in `/docker_environment` and name it msmd
-- run the docker image with the following script to set the right path
+## Repository Structure
 
 ```
-docker run --gpus all -it \
-    --name $CONTAINER_NAME \
-    --gpus all \
-    -v /path_to_this_directory/:/code \
-    -v /path_to_dataset/:/data \
-    -v /path_to_your_choice_of_output_folder/:/experiments \
-    msmd:latest \
-    /bin/bash
-
+MSMD/
+├── msmd/                    # Main package
+│   ├── models/              # DiffTalkingHead, StyleEncoder, FLAME
+│   ├── data/                # Dataset loaders and factory
+│   ├── utils/               # Loss functions, utilities
+│   └── options/             # Argument parsers
+├── train_diffusion.py       # Train the denoising network (MSMD / DPT)
+├── train_se.py              # Train the style encoder
+├── inference.py             # Standalone inference script
+├── scripts/
+│   ├── train_msmd.sh        # Training script for MSMD model
+│   ├── train_dpt.sh         # Training script for DiffPoseTalk baseline
+│   └── train_se.sh          # Training script for style encoder
+├── data/                    # Put your datasets here
+└── pretrained_models/
+    └── flame/               # FLAME model files (see below)
 ```
 
-# Running pre-processing pipeline:
+---
 
-To run the pipeline, make sure you place the dataset in this format. The video_split_*.pkl simply contains a list of file names of the videos.
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+> **Note:** Install PyTorch separately following the [official guide](https://pytorch.org/get-started/locally/) to match your CUDA version.
+
+---
+
+## Pretrained Models Setup
+
+### 1. FLAME Model Files
+
+Download the following files from the [FLAME official website](https://flame.is.tue.mpg.de/) (requires free registration):
+
+- `generic_model.pkl` — from **FLAME 2020**
+- `FLAME_albedo_from_BFM.npz` — from the FLAME texture model
+- `landmark_embedding.npy` — from the FLAME landmark embedding
+
+Download `FLAME_masks.pkl` from the [FLAME masks repository](https://github.com/TimoBolkart/FLAME_masks) (used by the evaluation scripts).
+
+Place all files in `pretrained_models/flame/`:
 
 ```
-/data/ravdess/
-├── videos/
-│   └── clips/         # Place your input videos here (.mp4 format)
-├── audios/
-│   └── clips/         # Place the input audios here (.wav/mp3/m4p)
-├── splitting/
-│   └── video_split_*.pkl # Files containing video splits information
+pretrained_models/flame/
+├── generic_model.pkl
+├── FLAME_albedo_from_BFM.npz
+├── landmark_embedding.npy
+└── FLAME_masks.pkl
 ```
-***Note that you NEED to have a facial reconstruction model for extracting the expression code (something like the FLAME or SEREP expression parameters). We do not provide it in our code.***
 
-To integrate the facial reconstruction model into the pipeline, simply replace the placeholder class `ExpressionCodeExtractor` in our code for your facial reconstruction model of choice. 
+### 2. Audio Encoder (HuBERT)
 
-Once the data + model are read. Run all of the code in /dataset_processing/ in sequence (step 1 - step 6) to obtain a processed dataset.
+The HuBERT encoder (`facebook/hubert-base-ls960`) is downloaded automatically from HuggingFace on first use and cached in `~/.cache/huggingface/`.
 
+### 3. Trained MSMD Checkpoints
 
-# Training code:
-
-To train the MSMD model as specified in the paper, first prepare both ravdess and celebv-text datasets using the pre-processing pipeline. Then run `training_spec.sh` to run the training loop with the specs used in the paper. Located inside `training_script.py`
-
-# Inference code:
-
-To generate outputs with the trained model, use `inference.py`. You must prepare an input audio file as a 16000hz wav file, as well as two pickle file containing the expression code and head rotation respectively. In addition, you must also prepare a picke file that stores the statistics (mean and std of the expression code + head rotation for normalizing the data, with the following keys):
-
-- `exp_mean`: Mean values for expression coefficients (tensor)
-- `exp_std`: Standard deviation values for expression coefficients (tensor)
-- `pose_mean`: Mean values for head pose/rotation (tensor)
-- `pose_std`: Standard deviation values for head pose/rotation (tensor)
-
-An example input looks like this:
+Download from [TODO: add link]. Place each experiment directory under `pretrained_models/checkpoints/`:
 
 ```
+pretrained_models/checkpoints/
+└── MSMD/
+    ├── args.json
+    └── checkpoints/
+        └── iter_XXXXXX.pt
+```
+
+---
+
+## Data Setup
+
+Place your processed datasets under `data/`. The expected structure depends on the dataset type:
+
+```
+data/
+├── coef_stats.npz                          # Coefficient statistics (mean/std)
+├── FLAME_celebv-text/                      # CelebV-Text processed data
+│   └── processed_flame_param/
+│       └── flame_param_merged.lmdb/
+└── FLAME_mead_ravdess/                     # MEAD + RAVDESS processed data
+    ├── train_*.pickle
+    └── val_*.pickle
+```
+
+See dataset preprocessing scripts in the original [DiffPoseTalk repository](https://github.com/DiffPoseTalk/DiffPoseTalk) for instructions on preparing `FLAME_celebv-text` and related datasets.
+
+---
+
+## Training
+
+Training is a two-step process:
+
+### Step 1: Train the Style Encoder
+
+```bash
+bash scripts/train_se.sh
+```
+
+Edit `scripts/train_se.sh` to set your `DATA_ROOT` and `STATS_FILE`. The checkpoint will be saved to `experiments/SE/<exp_name>-<timestamp>/`.
+
+### Step 2: Train the Denoising Network
+
+**MSMD model (paper):**
+```bash
+bash scripts/train_msmd.sh
+```
+
+**DiffPoseTalk baseline:**
+```bash
+bash scripts/train_dpt.sh
+```
+
+Edit the scripts to set `STYLE_ENC_CKPT` to the best checkpoint from Step 1. Checkpoints are saved to `experiments/dpt/<exp_name>-<timestamp>/`.
+
+You can also run training directly:
+```bash
+python train_diffusion.py \
+    --exp_name my_experiment \
+    --data_root data/ \
+    --dataset_type celebv-text-full+ravdess-FLMAE \
+    --audio_model hubert \
+    --fps 25 \
+    --use_normalization \
+    --stats_file data/coef_stats.npz \
+    --help  # to see all options
+```
+
+---
+
+## Inference
+
+Run inference on a single audio file:
+
+```bash
 python inference.py \
-  --model_root /path/to/models \
-  --model_name MODEL_NAME \
-  --model_iter ITERATION_NUMBER \
-  --style_clip_exp_code_path /path/to/expression/code.pkl \
-  --style_clip_head_rot_path /path/to/head/rotation.pkl \
-  --audio_clip /path/to/audio.wav \
-  --coef_dict_path /path/to/coefficient/statistics.pkl \
-  --cfg_level 1.4 \
-  --output_dir /path/to/output \
-  --versions_of_render 1
+    --model_dir pretrained_models/checkpoints/MSMD \
+    --audio path/to/audio.wav \
+    --output output_coefficients.npy \
+    --device cuda
 ```
 
-The script generates:
-1. Normalized expression coefficients (.pkl file)
-2. Normalized head rotation parameters (.pkl file)
-These outputs can be used with FLAME or similar 3D face models to render the final animated face video. You would need to implement your own. 
-© [2025] Ubisoft Entertainment. All Rights Reserved
+Optional arguments:
+- `--checkpoint 0190000` — specify a checkpoint iteration (defaults to latest)
+- `--shape_coef shape.npy` — FLAME shape coefficients [100,] (defaults to neutral)
+- `--style_coef style_motion.npy` — motion sequence for style reference [T, D]
+- `--cfg_scale 1.15` — classifier-free guidance scale
+
+The output `.npy` file contains motion coefficients of shape `[n_frames, coef_dim]` where `coef_dim` is typically 67 (100 expression + 3 jaw, reduced for CelebV-Text models).
+
+---
+
+## Evaluation (Benchmark)
+
+To reproduce evaluation numbers from the paper:
+
+```bash
+python benchmark_inference_for_eval.py \
+    --model_dir experiments/dpt/<exp_name> \
+    --checkpoint 0190000 \
+    --dataset_type celebv-text-flmae-full \
+    --data_root data/ \
+    --stats_file data/coef_stats.npz \
+    --output_dir results/
+```
+
+---
+
+## Citation
+
+If you use this code, please cite our paper:
+
+```bibtex
+@inproceedings{msmd2025,
+  title     = {TODO},
+  author    = {TODO},
+  booktitle = {TODO},
+  year      = {2025},
+}
+```
+
+This work builds on [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk):
+
+```bibtex
+@inproceedings{diffposetalk2024,
+  title={DiffPoseTalk: Speech-Driven Stylistic 3D Facial Animation and Head Pose Generation via Diffusion Models},
+  author={Sun, Zhiyao and Lv, Tian and Ye, Sheng and Lin, Matthieu Gaetan and Sheng, Jenny and Wen, Yu-Hui and Yu, Minjing and Liu, Yong-Jin},
+  booktitle={ACM SIGGRAPH 2024 Conference Papers},
+  year={2024},
+}
+```
+
+---
+
+## License
+
+See [LICENSE](LICENSE) for details. The FLAME model is subject to its own [license](https://flame.is.tue.mpg.de/modellicense.html).

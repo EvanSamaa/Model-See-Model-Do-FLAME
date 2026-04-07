@@ -1,287 +1,337 @@
-#!/usr/bin/env python
-import argparse
-import os
-import sys
-import gc
-import math
-from pathlib import Path
-import pickle as pkl
-from subprocess import check_call
+"""
+MSMD Inference Script
 
-import cv2
-from scipy.interpolate import interp1d
+Run inference on a single audio file to generate FLAME motion coefficients.
+
+Usage:
+    python inference.py \
+        --model_dir pretrained_models/checkpoints/MSMD \
+        --audio path/to/audio.wav \
+        --output output_coefficients.npy \
+        --device cuda
+
+The model_dir should contain:
+    - args.json          (saved training arguments)
+    - checkpoints/       (model checkpoint files, e.g. iter_XXXXXX.pt)
+"""
+
+import argparse
+import copy
+import gc
+import json
+import math
+import os
+import pickle as pkl
+import sys
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-import librosa
-from scipy.io import wavfile
-import json
-# Import custom modules (make sure these paths are correct for your installation)
-from model import get_diffusion_model
-from style_encoder import get_style_encoder
-from datasets import get_dataset
-from utils.flame import FLAME, FLAMEConfig
-from utils.model_common import load_pretrained_model, save_args
-from utils.common import compute_loss_no_vert, compute_loss
-from utils.common import compute_KL_loss
-import utils 
-from models import get_diffusion_model
 
-# =============================================================================
-# Helper functions (as in your original code)
-# =============================================================================
+import msmd.options.dpt as dpt_options
+import msmd.utils as utils
+from msmd.models.diff_talking_head import get_difftalkinghead_model
+from msmd.models.style_encoder import get_style_encoder
+from msmd.models.flame import FLAME, FLAMEConfig
+from msmd.models.common import load_args
+
+
+# ---------------------------------------------------------------------------
+# Compat shims for older libs (chumpy etc.)
+# ---------------------------------------------------------------------------
+import inspect
+from collections import namedtuple
+import numpy as _np
+
+_aliases = [
+    ('bool', _np.bool_),
+    ('int', int),
+    ('float', float),
+    ('complex', complex),
+    ('object', object),
+    ('unicode', str),
+    ('str', str),
+]
+for _name, _target in _aliases:
+    if not hasattr(_np, _name):
+        setattr(_np, _name, _target)
+
+if not hasattr(inspect, 'getargspec'):
+    def _shim_getargspec(func):
+        fas = inspect.getfullargspec(func)
+        ArgSpec = namedtuple('ArgSpec', 'args varargs keywords defaults')
+        return ArgSpec(fas.args, fas.varargs, fas.varkw, fas.defaults)
+    inspect.getargspec = _shim_getargspec
+
+
+# ---------------------------------------------------------------------------
+# Core inference helpers
+# ---------------------------------------------------------------------------
+
 @torch.no_grad()
-def infer_coeffs(model, args, audio, shape_coef, audio_unit, style_feats=None,
-                 n_repetitions: int = 1, cfg_mode=None, cfg_cond=None, cfg_scale: float = 1.15,
-                 include_shape: bool = False, dynamic_threshold=(0, 1, 4)):
-    clip_len = int(len(audio) / 16000 * args.fps)
+def infer_style_code(style_enc, motion_coeff, model_args):
+    """Extract style code from a motion coefficient sequence."""
+    enc_style = getattr(model_args, 'style_enc_model_style', 'diffposetalk')
+    if enc_style == 'vae2_with_lip_stats':
+        return style_enc(motion_coeff[:, :100, :], {})
+    elif enc_style is not None and enc_style[:3] == 'vae':
+        result = style_enc(motion_coeff[:, :100, :])
+        return result[0] if isinstance(result, tuple) else result
+    else:
+        return style_enc(motion_coeff[:, :100, :])
+
+
+@torch.no_grad()
+def infer_coefficients(
+    model,
+    args,
+    audio: torch.Tensor,
+    shape_coef: torch.Tensor,
+    audio_unit: float = 640.0,
+    style_feat=None,
+    cfg_mode=None,
+    cfg_cond=None,
+    cfg_scale: float = 1.0,
+    dynamic_threshold=None,
+) -> torch.Tensor:
+    """
+    Run autoregressive inference over the full audio sequence.
+
+    Args:
+        model:        Loaded DiffTalkingHead model (eval mode, on device).
+        args:         Namespace from load_args (contains fps, n_motions, etc.).
+        audio:        Float tensor of shape [1, audio_samples] at 16 kHz.
+        shape_coef:   Float tensor of shape [1, 100] (FLAME shape coefficients).
+        audio_unit:   Audio samples per motion frame (640 for 25 fps at 16 kHz).
+        style_feat:   Style feature tensor or list of tensors.
+        cfg_mode:     Classifier-free guidance mode (None to disable).
+        cfg_cond:     CFG condition list ([] to disable).
+        cfg_scale:    CFG scale factor.
+        dynamic_threshold: Dynamic thresholding tuple or None.
+
+    Returns:
+        Motion coefficient tensor of shape [1, n_frames, coef_dim].
+    """
+    clip_len = int(audio.shape[1] / 16000 * args.fps)
     stride = args.n_motions
     n_audio_samples = round(audio_unit * args.n_motions)
     n_subdivision = 1 if clip_len <= args.n_motions else math.ceil(clip_len / stride)
-    n_padding_audio_samples = n_audio_samples * n_subdivision - len(audio)
-    n_padding_frames = math.ceil(n_padding_audio_samples / audio_unit)
+    n_padding_audio_samples = n_audio_samples * n_subdivision - audio.shape[1]
+    n_padding_frames = math.ceil(n_padding_audio_samples / audio_unit) if n_padding_audio_samples > 0 else 0
+
     if n_padding_audio_samples > 0:
         audio = F.pad(audio, (0, n_padding_audio_samples), value=0)
-    audio_feat = model.extract_audio_feature(audio.unsqueeze(0), args.n_motions * n_subdivision)
+
+    audio_feat = model.extract_audio_feature(audio, args.n_motions * n_subdivision)
     coef_list = []
+    prev_motion_feat = None
+    prev_audio_feat = None
+    noise = None
+
     for i in range(n_subdivision):
+        if isinstance(style_feat, list):
+            sf = style_feat[i]
+        else:
+            sf = style_feat
+
         start_idx = i * stride
-        end_idx = start_idx + args.n_motions
-        indicator = torch.ones((n_repetitions, args.n_motions)).to(model.device) if args.use_indicator else None
+        indicator = (
+            torch.ones((audio_feat.shape[0], args.n_motions)).to(model.device)
+            if args.use_indicator else None
+        )
         if indicator is not None and i == n_subdivision - 1 and n_padding_frames > 0:
             indicator[:, -n_padding_frames:] = 0
-        audio_in = audio_feat[:, start_idx:end_idx].expand(n_repetitions, -1, -1)
-        style_feat = style_feats[i] if isinstance(style_feats, list) else style_feats
+
+        audio_in = audio_feat[:, start_idx:start_idx + args.n_motions]
+
         if i == 0:
             motion_feat, noise, prev_audio_feat = model.sample(
-                audio_in, shape_coef, style_feat, indicator=indicator,
+                audio_in, shape_coef, sf,
+                indicator=indicator,
                 cfg_mode=cfg_mode, cfg_cond=cfg_cond, cfg_scale=cfg_scale,
-                dynamic_threshold=dynamic_threshold
+                dynamic_threshold=dynamic_threshold,
             )
         else:
             motion_feat, noise, prev_audio_feat = model.sample(
-                audio_in, shape_coef, style_feat, prev_motion_feat, prev_audio_feat, noise,
-                indicator=indicator, cfg_mode=cfg_mode, cfg_cond=cfg_cond, cfg_scale=cfg_scale,
-                dynamic_threshold=dynamic_threshold
+                audio_in, shape_coef, sf,
+                prev_motion_feat, prev_audio_feat, noise,
+                indicator=indicator,
+                cfg_mode=cfg_mode, cfg_cond=cfg_cond, cfg_scale=cfg_scale,
+                dynamic_threshold=dynamic_threshold,
             )
+
         prev_motion_feat = motion_feat[:, -args.n_prev_motions:].clone()
         prev_audio_feat = prev_audio_feat[:, -args.n_prev_motions:]
+
         motion_coef = motion_feat
         if i == n_subdivision - 1 and n_padding_frames > 0:
             motion_coef = motion_coef[:, :-n_padding_frames]
         coef_list.append(motion_coef)
-    motion_coef = torch.cat(coef_list, dim=1)
-    return motion_coef
 
-# =============================================================================
-# Model-loading function
-# =============================================================================
-def load_args(save_dir):
-    with open(save_dir / 'args.json', 'r') as f:
-        args_dict = json.load(f)
-    args = argparse.Namespace(**args_dict)
-    return args
-def load_model(model_root: str, model_name: str, iter_num: str, device: torch.device):
+    return torch.cat(coef_list, dim=1)
+
+
+# ---------------------------------------------------------------------------
+# Model loading helpers
+# ---------------------------------------------------------------------------
+
+def load_model_and_style_encoder(model_dir: Path, checkpoint: Optional[str], device: str):
     """
-    Loads the diffusion talking-head model and the style encoder.
+    Load DiffTalkingHead model and style encoder from an experiment directory.
+
+    Args:
+        model_dir:   Path to the experiment directory (contains args.json + checkpoints/).
+        checkpoint:  Checkpoint iteration string (e.g. '0190000'). If None, loads latest.
+        device:      'cuda' or 'cpu'.
+
+    Returns:
+        (model, style_enc, model_args)
     """
-    # Load the training arguments
-    model_args = load_args(Path(os.path.join(model_root, "DPT", model_name)))
-    # (Optionally adjust dataset paths here as needed)
-    # Create the main model
-    model = get_diffusion_model(model_args)
-    model_ckpt_path = Path(model_root) / "DPT" / model_name / "checkpoints" / f"iter_{iter_num}.pt"
-    model_data = torch.load(model_ckpt_path, map_location=device)
-    enc_style = model_args.style_enc_model_style
-    enc_model = get_style_encoder(model_args, enc_style)
-    enc_model.load_state_dict(model_data['style_enc'])
-    enc_model.eval()
-    style_enc = enc_model
-    model.load_state_dict(model_data['model'])
+    model_args = load_args(model_dir)
+    model = get_difftalkinghead_model(model_args).to(device)
+
+    checkpoints_dir = model_dir / 'checkpoints'
+    if checkpoint is not None:
+        ckpt_path = checkpoints_dir / f'iter_{checkpoint}.pt'
+    else:
+        ckpt_files = sorted(checkpoints_dir.glob('iter_*.pt'))
+        if not ckpt_files:
+            raise FileNotFoundError(f'No checkpoints found in {checkpoints_dir}')
+        ckpt_path = ckpt_files[-1]
+
+    model_data = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    enc_style = getattr(model_args, 'style_enc_model_style', 'diffposetalk')
+    if enc_style is None:
+        enc_style = 'diffposetalk'
+
+    if enc_style == 'diffposetalk':
+        style_enc_ckpt = getattr(model_args, 'style_enc_ckpt', None)
+        if style_enc_ckpt and os.path.exists(style_enc_ckpt):
+            enc_model_data = torch.load(style_enc_ckpt, map_location=device, weights_only=False)
+        else:
+            raise FileNotFoundError(
+                f'Style encoder checkpoint not found: {style_enc_ckpt}\n'
+                f'Pass --style_enc_ckpt explicitly or use a MSMD-style checkpoint.'
+            )
+        enc_model_args = utils.NullableArgs(enc_model_data['args'])
+        style_enc = get_style_encoder(enc_model_args).to(device)
+        style_enc.encoder.load_state_dict(enc_model_data['encoder'], strict=False)
+        model.load_state_dict(model_data['model'])
+    else:
+        style_enc = get_style_encoder(model_args, enc_style).to(device)
+        style_enc.load_state_dict(model_data['style_enc'])
+        model.load_state_dict(model_data['model'])
+
     model.eval()
+    style_enc.eval()
     return model, style_enc, model_args
 
-# =============================================================================
-# loading expression code function
-# =============================================================================
 
-def query_for_motion_coeff(args: argparse.Namespace,
-                            expression_code_full_path: str,
-                           head_rot_full_path: str,
-                           device: str = "cuda",
-                           original_fps: float = 30,
-                           target_fps: float = 25):
-    """
-    Loads expression code and head rotation from the given full file paths,
-    normalizes them using coefficient statistics, optionally resamples them to a target FPS,
-    and returns the normalized motion coefficients and a dummy shape coefficient tensor.
-    
-    Parameters:
-        expression_code_full_path (str): Full path to the expression code pkl file.
-        head_rot_full_path (str): Full path to the head rotation pkl file.
-        device (str): The device to load the tensors onto (e.g. "cuda" or "cpu").
-        original_fps (float, optional): The original frames per second of the data.
-            If provided and different from target_fps, the data will be resampled.
-        target_fps (float): The desired frames per second after resampling (default: 25).
-    
-    Returns:
-        motion_coeff (torch.Tensor): A tensor (with a batch dimension) containing the normalized and,
-                                     if needed, resampled motion coefficients (expression + head rotation).
-        shape_coef (torch.Tensor): A dummy shape coefficient tensor of shape (1, 100).
-    """
-    # Load coefficient statistics (assumes they are stored as a tensor in a pkl file)
-    coef_stats_path = args.coef_dict_path
-    with open(coef_stats_path, "rb") as f:
-        coef_stats = pkl.load(f)
-
-    # Load expression code and head rotation using pkl
-    expression_coef = pkl.load(open(expression_code_full_path, "rb"))
-    head_rot = pkl.load(open(head_rot_full_path, "rb"))
-    
-    # If the loaded expression code is a tensor, detach and convert to numpy.
-    expression_coef = expression_coef.detach().cpu().numpy()
-    # If head_rot is a tensor, convert it similarly.
-    if isinstance(head_rot, torch.Tensor):
-        head_rot = head_rot.detach().cpu().numpy()
-    
-    # Normalize using coefficient statistics (adding a small epsilon to avoid division by zero)
-    exp_mean = coef_stats['exp_mean'].detach().cpu().numpy()
-    exp_std  = coef_stats['exp_std'].detach().cpu().numpy() + 1e-9
-    pose_mean = coef_stats['pose_mean'].detach().cpu().numpy()
-    pose_std  = coef_stats['pose_std'].detach().cpu().numpy() + 1e-9
-
-    expression_coef = (expression_coef - exp_mean) / exp_std
-    head_rot = (head_rot - pose_mean) / pose_std
-    
-    # Optionally resample to target_fps if original_fps is provided and is different
-    if original_fps is not None and original_fps != target_fps:
-        num_frames = expression_coef.shape[0]
-        # Create a normalized time axis for the current frames
-        x = np.linspace(0, 1, num=num_frames)
-        # Determine the new number of frames based on the desired target FPS
-        new_num_frames = int(round(num_frames / original_fps * target_fps))
-        xnew = np.linspace(0, 1, num=new_num_frames)
-        
-        # Resample the expression coefficients and head rotation along the time axis
-        f_exp = interp1d(x, expression_coef, axis=0)
-        expression_coef = f_exp(xnew)
-        
-        f_head = interp1d(x, head_rot, axis=0)
-        head_rot = f_head(xnew)
-    
-    # Convert the arrays to torch tensors and add a batch dimension
-    expression_tensor = torch.from_numpy(expression_coef).to(device).unsqueeze(0).float()
-    head_rot_tensor = torch.from_numpy(head_rot).to(device).unsqueeze(0).float()
-    
-    # Create a dummy shape coefficient tensor of zeros (shape: [1, 100])
-    shape_coef = torch.zeros((1, 100), device=device).float()
-    
-    # Concatenate expression and head rotation along the last dimension to form motion coefficients
-    motion_coeff = torch.cat([expression_tensor, head_rot_tensor], dim=2).float().to(device)
-    
-    return motion_coeff, shape_coef
-
-# =============================================================================
-# Main function: parse arguments and run inference on a single style+audio pair.
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Single inference for MSMD.")
-    parser.add_argument("--model_root", type=str, required=True, help="Root directory for models.")
-    parser.add_argument("--model_name", type=str, required=True, help="Name of the model.")
-    parser.add_argument("--model_iter", type=str, required=True, help="Checkpoint iteration (as string).")
-    parser.add_argument("--style_clip_exp_code_path", type=str, required=True, help="Name of the style video clip.")
-    parser.add_argument("--style_clip_head_rot_path", type=str, required=True, help="Name of the style video clip.")
-    parser.add_argument("--audio_clip", type=str, required=True, help="Name of the audio clip (without extension).")
-    parser.add_argument("--coef_dict_path", type=str, default="PATH-TO-COEF-STATS", help="Path to the coefficient statistics.")
-    # Flags (set to default values as specified)
-    parser.add_argument("--cfg_level", type=float, default=1.4, help="Configuration level (e.g., CFG scale).")
-    parser.add_argument("--output_dir", type=str, default="/experiments/refactor", help="Directory to save outputs.")
-    parser.add_argument("--versions_of_render", type=int, default=1, help="the number of times to render the video")
-    
-    # (Any additional arguments such as n_motions, n_prev_motions, fps, etc., should be in your model args.)
-    
-    Example_argument_list = [
-        "--model_root", "/experiments",
-        "--model_name", "MSMD", 
-        "--model_iter", "0470000",
-        "--style_clip_exp_code_path", "/data/expression_code_ver2/video_name.pkl", # <===================== path the video
-        "--style_clip_head_rot_path", "/data/head_orientations/video_name.pkl",
-        "--audio_clip", "/data/evan_iconic_speech/full_audios/video_name_full_audio.wav",
-        "--versions_of_render", "1",
-    ]
-
-    # args = parser.parse_args(TEST_argument_list)
+    parser = argparse.ArgumentParser(description='MSMD inference: audio → FLAME motion coefficients')
+    parser.add_argument('--model_dir', type=str, required=True,
+                        help='Path to experiment directory (contains args.json and checkpoints/)')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                        help='Checkpoint iteration string, e.g. "0190000". Defaults to latest.')
+    parser.add_argument('--audio', type=str, required=True,
+                        help='Path to input audio file (.wav at 16 kHz)')
+    parser.add_argument('--shape_coef', type=str, default=None,
+                        help='Path to .npy file containing shape coefficients [100,]. '
+                             'If not provided, uses zeros (neutral shape).')
+    parser.add_argument('--style_coef', type=str, default=None,
+                        help='Path to .npy file with motion sequence to use as style reference '
+                             '[T, coef_dim]. If not provided, infers from identity motion.')
+    parser.add_argument('--output', type=str, default='output_coefficients.npy',
+                        help='Output path for motion coefficients (.npy or .json)')
+    parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--cfg_scale', type=float, default=1.0,
+                        help='Classifier-free guidance scale (1.0 = disabled)')
+    parser.add_argument('--audio_unit', type=float, default=640.0,
+                        help='Audio samples per motion frame (default: 640 = 16000/25)')
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = args.device
+    model_dir = Path(args.model_dir)
 
-    # Load the model and style encoder
-    model, style_enc, model_args = load_model(args.model_root, args.model_name, args.model_iter, device)
-    model.to(device)
-    style_enc.to(device)
+    # --- Load model ---
+    print(f'Loading model from {model_dir}...')
+    model, style_enc, model_args = load_model_and_style_encoder(model_dir, args.checkpoint, device)
+    print('Model loaded.')
 
-    # Query the dataset for the style clip; here we ignore the returned audio.
-    motion_coeff, shape_coef = query_for_motion_coeff(args.style_clip_exp_code_path, args.style_clip_head_rot_path, device=device)
-    motion_coeff = motion_coeff.to(device)
-    shape_coef = shape_coef.unsqueeze(1).to(device)
+    # --- Load audio ---
+    import librosa
+    print(f'Loading audio from {args.audio}...')
+    audio_np, sr = librosa.load(args.audio, sr=16000, mono=True)
+    audio = torch.tensor(audio_np, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T]
+    print(f'Audio: {audio.shape[1]} samples ({audio.shape[1]/16000:.2f} s)')
 
-    # Load the audio clip (assumed to be stored in a known root)
-    audio_source_path = args.audio_clip
-    audio_data = librosa.load(audio_source_path, sr=16000)[0]
-    # Normalize audio
-    audio_data = (audio_data - audio_data.mean()) / (audio_data.std() + 1e-5)
-    audio_tensor = torch.tensor(audio_data).float().to(device)
-
-    # Compute the style code.
-    if model_args.style_enc_model_style.startswith("vae"):
-        style_coeff = style_enc.sample(motion_coeff[:, :100, :])
+    # --- Load shape coefficients ---
+    if args.shape_coef is not None:
+        shape_np = np.load(args.shape_coef)
+        shape_coef = torch.tensor(shape_np, dtype=torch.float32).unsqueeze(0).to(device)
     else:
-        style_coeff = style_enc(motion_coeff[:, :100, :]).to(device)
+        print('No shape coefficients provided, using neutral (zeros).')
+        shape_coef = torch.zeros(1, 100, dtype=torch.float32).to(device)
 
-    # ========================= this should store the mean and std of the dataset, used to normalize and un-normalize the expression code =========================
-    coef_stats = pkl.load(open(args.coef_dict_path, "rb"))
-    # Get coefficient statistics from the dataset and send to device.
-    coef_stats = {k: v.to(device) for k, v in coef_stats.items()}
+    # --- Compute style feature ---
+    if args.style_coef is not None:
+        style_np = np.load(args.style_coef)  # [T, coef_dim]
+        style_motion = torch.tensor(style_np, dtype=torch.float32).unsqueeze(0).to(device)  # [1, T, D]
+        print(f'Using provided style reference: {style_motion.shape}')
+        style_feat = infer_style_code(style_enc, style_motion, model_args)
+    else:
+        # Use a zero motion sequence as neutral style
+        n_motions = model_args.n_motions
+        coef_dim = 67  # default for celebv-text models (100 exp + 3 jaw + head reduced)
+        try:
+            coef_dim = model_args.coef_dim
+        except AttributeError:
+            pass
+        style_motion = torch.zeros(1, n_motions, coef_dim, dtype=torch.float32).to(device)
+        style_feat = infer_style_code(style_enc, style_motion, model_args)
+        print('Using neutral style (zero motion).')
 
-    # Prepare output directories.
-    style_clip_name = os.path.splitext(os.path.basename(args.style_clip_exp_code_path))[0]
-    audio_clip_name = os.path.splitext(os.path.basename(args.audio_clip))[0]
-    output_clip_name = f"style=_{style_clip_name}_audio={audio_clip_name}"
-    
-    folder_name = f"{args.model_name}_iter_{args.model_iter}"
-    save_dir = os.path.join(args.output_dir, folder_name)
-    os.makedirs(save_dir, exist_ok=True)
-    temp_subfolder = os.path.join(save_dir, "temp")
-    os.makedirs(temp_subfolder, exist_ok=True)
-    video_subfolder = os.path.join(save_dir, output_clip_name)
-    os.makedirs(video_subfolder, exist_ok=True)
+    # --- Run inference ---
+    print('Running inference...')
+    with torch.no_grad():
+        motion_coef = infer_coefficients(
+            model=model,
+            args=model_args,
+            audio=audio,
+            shape_coef=shape_coef,
+            audio_unit=args.audio_unit,
+            style_feat=style_feat,
+            cfg_mode=None,
+            cfg_cond=[],
+            cfg_scale=args.cfg_scale,
+            dynamic_threshold=None,
+        )
+    print(f'Generated motion coefficients: {motion_coef.shape}')
 
-    # Save the normalized audio as a .wav file.
-    audio_path = os.path.join(temp_subfolder, output_clip_name)
-    wavfile.write(audio_path, 16000, audio_tensor.cpu().numpy())
-    # -------------------------------------------------------------------------
-    for count_i in range(0, args.versions_of_render):
-        # Inference
-        np.random.seed(count_i)
-        torch.manual_seed(count_i)
-        with torch.no_grad():
-            overall_coef = infer_coeffs(
-                model, model_args, audio_tensor, shape_coef, 640.0, style_coeff,
-                cfg_scale=args.cfg_level, dynamic_threshold=None
-            )
-        overall_expression_code = overall_coef[0, :, :-3] * coef_stats['exp_std'] + coef_stats['exp_mean']
-        overall_head_rot = overall_coef[0, :, -3:] * coef_stats['pose_std'] + coef_stats['pose_mean']
-        overall_exp_code_path = os.path.join(temp_subfolder, f"overall_exp_code_{output_clip_name}_seed_{count_i}.pkl")
-        overall_head_rot_path = os.path.join(temp_subfolder, f"overall_head_rot_{output_clip_name}_seed_{count_i}.pkl")
-        pkl.dump(overall_expression_code.cpu().numpy(), open(overall_exp_code_path, "wb"))
-        pkl.dump(overall_head_rot.cpu().numpy(), open(overall_head_rot_path, "wb"))
-        
-        # =========================================================================       
-        # Use SEREP/FLAME decoder to generate mesh from the expression coefficients now 
-        # =========================================================================
+    # --- Save output ---
+    output_path = Path(args.output)
+    result = motion_coef.squeeze(0).cpu().numpy()  # [n_frames, coef_dim]
+
+    if output_path.suffix == '.json':
+        with open(output_path, 'w') as f:
+            json.dump({'motion_coeff': result.tolist(), 'n_frames': result.shape[0]}, f)
+    else:
+        np.save(output_path, result)
+
+    print(f'Saved to {output_path}  [{result.shape[0]} frames × {result.shape[1]} dims]')
+
+    # Cleanup
+    del audio, shape_coef, style_feat, motion_coef
+    torch.cuda.empty_cache()
+    gc.collect()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
