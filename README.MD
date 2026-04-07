@@ -39,7 +39,9 @@ pip install -r requirements.txt
 
 ---
 
-## Pretrained Models Setup
+### 0. Pretrained Models Setup
+can download the pretrained model from here
+https://drive.google.com/drive/folders/1rxyGPbro5uLAayhKOsSDhBH8dAq9W_20?usp=sharing
 
 ### 1. FLAME Model Files
 
