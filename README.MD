@@ -1,6 +1,6 @@
 # MSMD: Motion Style and Motion Diffusion
 
-Semi-Official code release for the MSMD paper based on FLAME coefficients rather than the original SEREP model for reproducibility. This code is produced by Yifang (Evan) Pan, after the internship with Ubisoft has finished. 
+Semi-Official code release for the MSMD paper based on FLAME coefficients rather than the original SEREP model for reproducibility. This code is produced by *Yifang (Evan) Pan*, after the internship with Ubisoft La Forge has terminated, and not trained on any internal data and pretrained model from Ubisoft La Forge.
 
 MSMD is a speech-driven 3D facial animation system that generates stylistic, diverse FLAME motion coefficients from audio, and a 4-second (100 frames @ 25-fps) style reference. 
 
