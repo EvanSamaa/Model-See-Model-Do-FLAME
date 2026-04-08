@@ -1,8 +1,8 @@
 # MSMD: Motion Style and Motion Diffusion
 
-Official code release for the MSMD paper.
+Semi-Official code release for the MSMD paper based on FLAME coefficients rather than the original SEREP model for reproducibility. This code is produced by Yifang (Evan) Pan, after the internship with Ubisoft has finished. 
 
-MSMD is a speech-driven 3D facial animation system that generates stylistic, diverse FLAME motion coefficients from audio. It builds on [DiffPoseTalk](https://github.com/DiffPoseTalk/DiffPoseTalk) with a static/dynamic motion decomposition and a VAE-based style encoder.
+MSMD is a speech-driven 3D facial animation system that generates stylistic, diverse FLAME motion coefficients from audio, and a 4-second (100 frames @ 25-fps) style reference. 
 
 ---
 
@@ -189,11 +189,23 @@ python benchmark_inference_for_eval.py \
 If you use this code, please cite our paper:
 
 ```bibtex
-@inproceedings{msmd2025,
-  title     = {TODO},
-  author    = {TODO},
-  booktitle = {TODO},
-  year      = {2025},
+@inproceedings{10.1145/3721238.3730672,
+author = {Pan, Yifang and Singh, Karan and Hafemann, Luiz Gustavo},
+title = {Model See Model Do: Speech-Driven Facial Animation with Style Control},
+year = {2025},
+isbn = {9798400715402},
+publisher = {Association for Computing Machinery},
+address = {New York, NY, USA},
+url = {https://doi.org/10.1145/3721238.3730672},
+doi = {10.1145/3721238.3730672},
+abstract = {Speech-driven 3D facial animation plays a key role in applications such as virtual avatars, gaming, and digital content creation. While existing methods have made significant progress in achieving accurate lip synchronization and generating basic emotional expressions, they often struggle to capture and effectively transfer nuanced performance styles. We propose a novel example-based generation framework that conditions a latent diffusion model on a reference style clip to produce highly expressive and temporally coherent facial animations. To address the challenge of accurately adhering to the style reference, we introduce a novel conditioning mechanism called style basis, which extracts key poses from the reference and additively guides the diffusion generation process to fit the style without compromising lip synchronization quality. This approach enables the model to capture subtle stylistic cues while ensuring that the generated animations align closely with the input speech. Extensive qualitative, quantitative, and perceptual evaluations demonstrate the effectiveness of our method in faithfully reproducing the desired style while achieving superior lip synchronization across various speech scenarios.},
+booktitle = {Proceedings of the Special Interest Group on Computer Graphics and Interactive Techniques Conference Conference Papers},
+articleno = {88},
+numpages = {10},
+keywords = {facial animation, diffusion model, animation system},
+location = {
+},
+series = {SIGGRAPH Conference Papers '25}
 }
 ```
 
